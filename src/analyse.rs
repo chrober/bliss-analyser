@@ -393,12 +393,12 @@ pub fn analyse_files(db_path: &str, mpaths: &Vec<PathBuf>, dry_run: bool, keep_o
 
     db.init();
 
+    let mut changes_made = false;
     if !keep_old {
         send_notif(&mut notifs, "Removing old files from DB");
-        db.remove_old(mpaths, dry_run);
+        changes_made = db.remove_old(mpaths, dry_run);
     }
 
-    let mut changes_made = false;
     for path in mpaths {
         let mpath = path.clone();
         let cur = path.clone();
