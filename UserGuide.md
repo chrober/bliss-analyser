@@ -88,12 +88,15 @@ Command-line parameters
 * `-d` / `--db` Name and location of the database file.
 * `-l` / `--logging` Logging level; `trace`, `debug`, `info`, `warn`, `error`.
 Default is `info`.
-* `-k` / `--keep-old` When analysing tracks, `bliss-analyser` will remove any
-tracks specified in its database that are no-longer on the file-system. This
-parameter is used to prevent this.
+* `-k` / `--keep-old` When analysing tracks, `bliss-analyser` will remove database
+rows for tracks that are no longer on the filesystem. It also reconciles stored
+case-only path differences with the filesystem's exact spelling, preserving the
+existing analysis, and removes stale case-only duplicates. This option prevents
+all of those cleanup actions.
 * `-r` / `--dry-run` If this is supplied when analysing tracks, then no actual
-analysis will be performed, instead the logging will inform you how many new
-tracks are to be analysed and how many old tracks are left in the database.
+analysis or database cleanup will be performed, instead the logging will inform
+you how many new tracks are to be analysed, how many old tracks are left in the
+database, and which stored paths would have their filename casing corrected.
 * `-i` / `--ignore` Name and location of the file containing items to ignore.
 * `-L` / `--lms` Hostname, or IP address, of your LMS server.
 * `-J` / `--json` JSONRPC port number of your LMS server.

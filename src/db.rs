@@ -10,10 +10,12 @@ use crate::tags;
 use bliss_audio::{Analysis, AnalysisIndex, FeaturesVersion};
 use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::{params, Connection};
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
-use std::fs::File;
+use std::ffi::OsString;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::thread;
 use std::thread::JoinHandle;
@@ -74,6 +76,159 @@ fn handle_ctrl_c() {
 
 pub struct Db {
     pub conn: Connection,
+}
+
+#[derive(Debug, PartialEq)]
+enum PathResolution {
+    Exact,
+    Corrected(String),
+    Missing,
+    Unknown,
+}
+
+struct ExactPathResolver {
+    roots: Vec<PathBuf>,
+    directory_entries: HashMap<PathBuf, Option<DirectoryEntries>>,
+}
+
+struct DirectoryEntries {
+    exact: HashSet<OsString>,
+    case_insensitive: HashMap<String, Option<OsString>>,
+}
+
+impl ExactPathResolver {
+    fn new(roots: &Vec<PathBuf>) -> Self {
+        Self {
+            roots: roots.to_vec(),
+            directory_entries: HashMap::new(),
+        }
+    }
+
+    fn entries(&mut self, directory: &Path) -> Option<&DirectoryEntries> {
+        if !self.directory_entries.contains_key(directory) {
+            let entries = match fs::read_dir(directory) {
+                Ok(entries) => {
+                    let names = entries.map(|entry| entry.map(|entry| entry.file_name())).collect::<std::io::Result<Vec<_>>>();
+                    match names {
+                        Ok(names) => {
+                            let mut exact = HashSet::with_capacity(names.len());
+                            let mut case_insensitive = HashMap::with_capacity(names.len());
+
+                            for name in names {
+                                exact.insert(name.clone());
+                                if let Some(entry_text) = name.to_str() {
+                                    let folded = entry_text.to_lowercase();
+                                    match case_insensitive.get_mut(&folded) {
+                                        Some(existing) => *existing = None,
+                                        None => {
+                                            case_insensitive.insert(folded, Some(name));
+                                        }
+                                    }
+                                }
+                            }
+
+                            Some(DirectoryEntries {
+                                exact,
+                                case_insensitive,
+                            })
+                        }
+                        Err(_) => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            self.directory_entries
+                .insert(directory.to_path_buf(), entries);
+        }
+        self.directory_entries
+            .get(directory)
+            .and_then(|entries| entries.as_ref())
+    }
+
+    fn resolve_under_root(&mut self, root: &Path, relative: &Path) -> PathResolution {
+        let mut current = root.to_path_buf();
+        let mut resolved = PathBuf::new();
+        let mut corrected = false;
+        for component in relative.components() {
+            let requested = match component {
+                Component::CurDir => continue,
+                Component::Normal(name) => name,
+                _ => return PathResolution::Unknown,
+            };
+            let entries = match self.entries(&current) {
+                Some(entries) => entries,
+                None => return PathResolution::Unknown,
+            };
+            let actual = if entries.exact.contains(requested) {
+                requested.to_os_string()
+            } else {
+                let folded = match requested.to_str() {
+                    Some(requested) => requested.to_lowercase(),
+                    None => return PathResolution::Missing,
+                };
+                let actual = match entries.case_insensitive.get(&folded) {
+                    Some(Some(actual)) => actual.clone(),
+                    Some(None) => return PathResolution::Unknown,
+                    None => return PathResolution::Missing,
+                };
+                corrected = true;
+                actual
+            };
+            current.push(&actual);
+            resolved.push(actual);
+        }
+        if resolved.as_os_str().is_empty() {
+            PathResolution::Unknown
+        } else if corrected {
+            PathResolution::Corrected(normalize_db_path(&resolved))
+        } else {
+            PathResolution::Exact
+        }
+    }
+
+    fn resolve(&mut self, db_path: &str) -> PathResolution {
+        let (file_path, cue_suffix) = match db_path.find(CUE_MARKER) {
+            Some(index) => (&db_path[..index], &db_path[index..]),
+            None => (db_path, ""),
+        };
+        let relative = PathBuf::from(file_path);
+        let mut correction: Option<String> = None;
+        let mut unknown = false;
+        for root in self.roots.clone() {
+            match self.resolve_under_root(&root, &relative) {
+                PathResolution::Exact => return PathResolution::Exact,
+                PathResolution::Corrected(path) => {
+                    let candidate = format!("{}{}", path, cue_suffix);
+                    match correction.as_ref() {
+                        Some(existing) if existing != &candidate => {
+                            unknown = true;
+                        }
+                        _ => {
+                            correction = Some(candidate);
+                        }
+                    }
+                }
+                PathResolution::Unknown => unknown = true,
+                PathResolution::Missing => {}
+            }
+        }
+        if unknown {
+            PathResolution::Unknown
+        } else if let Some(path) = correction {
+            PathResolution::Corrected(path)
+        } else {
+            PathResolution::Missing
+        }
+    }
+}
+
+fn normalize_db_path(path: &Path) -> String {
+    let path = path.to_string_lossy().to_string();
+    if cfg!(windows) {
+        path.replace("\\", "/")
+    } else {
+        path
+    }
 }
 
 impl Db {
@@ -230,9 +385,11 @@ impl Db {
         let _ = self.conn.execute("DELETE FROM Failures WHERE File = ?;", params![path]);
     }
 
-    pub fn remove_old(&self, mpaths: &Vec<PathBuf>, dry_run: bool) {
-        self.remove_old_from_table(mpaths, dry_run, "TracksV2");
-        self.remove_old_from_table(mpaths, dry_run, "Failures");
+    pub fn remove_old(&self, mpaths: &Vec<PathBuf>, dry_run: bool) -> bool {
+        let mut resolver = ExactPathResolver::new(mpaths);
+        let tracks_changed = self.remove_old_from_table(dry_run, "TracksV2", &mut resolver);
+        let failures_changed = self.remove_old_from_table(dry_run, "Failures", &mut resolver);
+        tracks_changed || failures_changed
     }
 
     fn clear_failures(&self) {
@@ -254,64 +411,85 @@ impl Db {
         ts
     }
 
-    fn remove_old_from_table(&self, mpaths: &Vec<PathBuf>, dry_run: bool, table: &str) {
-        log::info!("Looking for non-existent tracks");
-        let mut stmt = self.conn.prepare(format!("SELECT File FROM {};", table).as_str()).unwrap();
-        let track_iter = stmt.query_map([], |row| Ok((row.get(0)?,))).unwrap();
+    fn remove_old_from_table(&self, dry_run: bool, table: &str, resolver: &mut ExactPathResolver) -> bool {
+        log::info!("Looking for missing or case-mismatched paths in {}", table);
+        let mut stmt = self.conn.prepare(format!("SELECT File FROM {} ORDER BY File;", table).as_str()).unwrap();
+        let file_iter = stmt.query_map([], |row| Ok((row.get(0)?,))).unwrap();
+        let mut files: Vec<String> = Vec::new();
+        for file in file_iter {
+            files.push(file.unwrap().0);
+        }
+
+        let known_paths: HashSet<String> = files.iter().cloned().collect();
+        let mut claimed_paths: HashSet<String> = HashSet::new();
         let mut to_remove: Vec<String> = Vec::new();
-        for tr in track_iter {
-            let mut db_path: String = tr.unwrap().0;
-            let orig_path = db_path.clone();
-            match orig_path.find(CUE_MARKER) {
-                Some(s) => {
-                    db_path.truncate(s);
+        let mut to_correct: Vec<(String, String)> = Vec::new();
+        let mut unverified_count = 0;
+
+        for original in files {
+            match resolver.resolve(&original) {
+                PathResolution::Exact => {}
+                PathResolution::Corrected(corrected) => {
+                    if known_paths.contains(&corrected)
+                        || !claimed_paths.insert(corrected.clone())
+                    {
+                        to_remove.push(original);
+                    } else {
+                        to_correct.push((original, corrected));
+                    }
                 }
-                None => {}
-            }
-            if cfg!(windows) {
-                db_path = db_path.replace("/", "\\");
-            }
-            let mut exists = false;
-
-            for mpath in mpaths {
-                let path = mpath.join(PathBuf::from(db_path.clone()));
-                //log::debug!("Check if '{}' exists.", path.to_string_lossy());
-
-                if path.exists() {
-                    exists = true;
-                    break;
+                PathResolution::Missing => to_remove.push(original),
+                PathResolution::Unknown => {
+                    unverified_count += 1;
                 }
-            }
-
-            if !exists {
-                to_remove.push(orig_path);
             }
         }
 
         let num_to_remove = to_remove.len();
-        log::info!("Num non-existent tracks: {}", num_to_remove);
-        if num_to_remove > 0 {
-            if dry_run {
+        let num_to_correct = to_correct.len();
+        log::info!("Num missing/duplicate paths: {}", num_to_remove);
+        log::info!("Num case-only path corrections: {}", num_to_correct);
+        if unverified_count > 0 {
+            log::warn!(
+                "Could not verify exact filesystem spelling for {} path(s) in {}; keeping those database rows",
+                unverified_count,
+                table
+            );
+        }
+        if dry_run {
+            if num_to_remove > 0 {
                 log::info!("The following need to be removed from database:");
-                for t in to_remove {
-                    log::info!("  {}", t);
+                for path in &to_remove {
+                    log::info!("  {}", path);
                 }
-            } else {
-                let count_before = self.get_track_count();
-                for t in to_remove {
-                    //log::debug!("Remove '{}'", t);
-                    let cmd = self.conn.execute(format!("DELETE FROM {} WHERE File = ?;", table).as_str(), params![t]);
+            }
+            if num_to_correct > 0 {
+                log::info!("The following stored path spellings need correction:");
+                for (from, to) in &to_correct {
+                    log::info!("  {} -> {}", from, to);
+                }
+            }
+            return false;
+        }
 
-                    if let Err(e) = cmd {
-                        log::error!("Failed to remove '{}' - {}", t, e)
-                    }
-                }
-                let count_now = self.get_track_count();
-                if (count_now + num_to_remove) != count_before {
-                    log::error!("Failed to remove all tracks. Count before: {}, wanted to remove: {}, count now: {}", count_before, num_to_remove, count_now);
+        let mut changed = false;
+        for (from, to) in to_correct {
+            let cmd = self.conn.execute(format!("UPDATE {} SET File = ? WHERE File = ?;", table).as_str(), params![to, from]);
+            match cmd {
+                Ok(count) => changed |= count > 0,
+                Err(error) => {
+                    log::error!("Failed to correct '{}' to '{}' - {}", from, to, error)
                 }
             }
         }
+        for path in to_remove {
+            let cmd = self.conn.execute(format!("DELETE FROM {} WHERE File = ?;", table).as_str(), params![path]);
+            match cmd {
+                Ok(count) => changed |= count > 0,
+                Err(error) => log::error!("Failed to remove '{}' - {}", path, error),
+            }
+        }
+        changed
     }
 
     pub fn get_track_count(&self) -> usize {
@@ -560,4 +738,166 @@ pub fn update_ignore(db_path: &str, ignore_path: &PathBuf) {
     }
 
     db.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestMusicRoot {
+        path: PathBuf,
+    }
+
+    impl TestMusicRoot {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "bliss-analyser-path-test-{}-{}",
+                process::id(),
+                unique
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn create_file(&self, relative: &str) {
+            let path = self.path.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            File::create(path).unwrap();
+        }
+    }
+
+    impl Drop for TestMusicRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn test_db() -> Db {
+        let db = Db {
+            conn: Connection::open_in_memory().unwrap(),
+        };
+        db.init();
+        db
+    }
+
+    fn insert_track(db: &Db, path: &str) -> i64 {
+        db.conn
+            .execute("INSERT INTO TracksV2 (File) VALUES (?);", params![path])
+            .unwrap();
+        db.conn.last_insert_rowid()
+    }
+
+    fn track_paths(db: &Db) -> Vec<(i64, String)> {
+        let mut statement = db
+            .conn
+            .prepare("SELECT rowid, File FROM TracksV2 ORDER BY File;")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn corrects_case_only_path_in_place() {
+        let music = TestMusicRoot::new();
+        music.create_file("Artist/Album/Track.mp3");
+        let db = test_db();
+        let original_rowid = insert_track(&db, "artist/album/track.mp3");
+
+        assert!(db.remove_old(&vec![music.path.clone()], false));
+        assert_eq!(
+            vec![(original_rowid, "Artist/Album/Track.mp3".to_string())],
+            track_paths(&db)
+        );
+    }
+
+    #[test]
+    fn removes_stale_case_variant_when_exact_row_exists() {
+        let music = TestMusicRoot::new();
+        music.create_file("Artist/Album/Track.mp3");
+        let db = test_db();
+        insert_track(&db, "artist/album/track.mp3");
+        let exact_rowid = insert_track(&db, "Artist/Album/Track.mp3");
+
+        assert!(db.remove_old(&vec![music.path.clone()], false));
+        assert_eq!(
+            vec![(exact_rowid, "Artist/Album/Track.mp3".to_string())],
+            track_paths(&db)
+        );
+    }
+
+    #[test]
+    fn dry_run_reports_without_mutating() {
+        let music = TestMusicRoot::new();
+        music.create_file("Artist/Album/Track.mp3");
+        let db = test_db();
+        let original_rowid = insert_track(&db, "artist/album/track.mp3");
+
+        assert!(!db.remove_old(&vec![music.path.clone()], true));
+        assert_eq!(
+            vec![(original_rowid, "artist/album/track.mp3".to_string())],
+            track_paths(&db)
+        );
+    }
+
+    #[test]
+    fn corrects_case_without_losing_cue_track_suffix() {
+        let music = TestMusicRoot::new();
+        music.create_file("Artist/Album/Image.flac");
+        let db = test_db();
+        let original_rowid = insert_track(&db, "artist/album/image.flac.CUE_TRACK.02");
+
+        assert!(db.remove_old(&vec![music.path.clone()], false));
+        assert_eq!(
+            vec![(
+                original_rowid,
+                "Artist/Album/Image.flac.CUE_TRACK.02".to_string()
+            )],
+            track_paths(&db)
+        );
+    }
+
+    #[test]
+    fn removes_path_that_is_really_missing() {
+        let music = TestMusicRoot::new();
+        let db = test_db();
+        insert_track(&db, "Artist/Album/Missing.mp3");
+
+        assert!(db.remove_old(&vec![music.path.clone()], false));
+        assert!(track_paths(&db).is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn keeps_distinct_files_that_differ_only_by_case() {
+        let music = TestMusicRoot::new();
+        music.create_file("Artist/Track.mp3");
+        music.create_file("artist/track.mp3");
+        let entries: HashSet<OsString> = fs::read_dir(&music.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        if entries.len() != 2 {
+            return;
+        }
+        let db = test_db();
+        let first_rowid = insert_track(&db, "Artist/Track.mp3");
+        let second_rowid = insert_track(&db, "artist/track.mp3");
+
+        assert!(!db.remove_old(&vec![music.path.clone()], false));
+        assert_eq!(
+            vec![
+                (first_rowid, "Artist/Track.mp3".to_string()),
+                (second_rowid, "artist/track.mp3".to_string())
+            ],
+            track_paths(&db)
+        );
+    }
 }
