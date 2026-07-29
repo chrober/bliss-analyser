@@ -1,3 +1,8 @@
+0.5.3
+-----
+1. Fix stale case-only paths on case-insensitive filesystems - thanks to
+   chrober for implementation.
+
 0.5.2
 -----
 1. Fix Linux builds.
